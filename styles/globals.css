@@ -1,0 +1,53 @@
+html,
+body {
+  padding: 0;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen,
+    Ubuntu, Cantarell, Fira Sans, Droid Sans, Helvetica Neue, sans-serif;
+  background: rgb(20,20,20);
+  color: white;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button {
+  padding: 10px;
+  background: rgb(68,125,61);
+  color: white;
+  border: 0.01em solid white;
+  border-radius: 4px;
+}
+
+
+button.disabled {
+  background: rgb(88, 146, 80);
+  cursor: default;
+}
+button.disabled:hover {
+  background: rgb(88, 146, 80);
+  cursor: default;
+}
+button.disabled:active {
+  background: rgb(88, 146, 80);
+  cursor: default;
+}
+
+button:hover {
+  background: rgb(81, 150, 72);
+  cursor: pointer;
+}
+
+button:active {
+  background: rgb(94, 172, 83);
+}
+
+::placeholder {
+  color: #dddddd
+}

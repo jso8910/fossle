@@ -1,0 +1,436 @@
+package proxy
+
+import (
+	"net"
+	"reflect"
+	"strconv"
+	"sync"
+	"time"
+
+	"k8s.io/client-go/tools/events"
+	"k8s.io/klog/v2"
+
+	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/proxy/metrics"
+	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
+	utilnet "k8s.io/utils/net"
+)
+
+var supportedEndpointSliceAddressTypes = sets.NewString(
+	string(discovery.AddressTypeIPv4),
+	string(discovery.AddressTypeIPv6),
+)
+
+type BaseEndpointInfo struct {
+	Endpoint string
+	IsLocal bool
+
+	ZoneHints sets.String
+	Ready bool
+	Serving bool
+	Terminating bool
+
+	NodeName string
+	Zone string
+}
+
+var _ Endpoint = &BaseEndpointInfo{}
+
+func (info *BaseEndpointInfo) String() string {
+	return info.Endpoint
+}
+
+func (info *BaseEndpointInfo) GetIsLocal() bool {
+	return info.IsLocal
+}
+
+func (info *BaseEndpointInfo) IsReady() bool {
+	return info.Ready
+}
+
+func (info *BaseEndpointInfo) IsServing() bool {
+	return info.Serving
+}
+
+func (info *BaseEndpointInfo) IsTerminating() bool {
+	return info.Terminating
+}
+
+func (info *BaseEndpointInfo) GetZoneHints() sets.String {
+	return info.ZoneHints
+}
+
+func (info *BaseEndpointInfo) IP() string {
+	return utilproxy.IPPart(info.Endpoint)
+}
+
+func (info *BaseEndpointInfo) Port() (int, error) {
+	return utilproxy.PortPart(info.Endpoint)
+}
+
+func (info *BaseEndpointInfo) Equal(other Endpoint) bool {
+	return info.String() == other.String() &&
+		info.GetIsLocal() == other.GetIsLocal() &&
+		info.IsReady() == other.IsReady()
+}
+
+func (info *BaseEndpointInfo) GetNodeName() string {
+	return info.NodeName
+}
+
+func (info *BaseEndpointInfo) GetZone() string {
+	return info.Zone
+}
+
+func newBaseEndpointInfo(IP, nodeName, zone string, port int, isLocal bool,
+	ready, serving, terminating bool, zoneHints sets.String) *BaseEndpointInfo {
+	return &BaseEndpointInfo{
+		Endpoint:    net.JoinHostPort(IP, strconv.Itoa(port)),
+		IsLocal:     isLocal,
+		Ready:       ready,
+		Serving:     serving,
+		Terminating: terminating,
+		ZoneHints:   zoneHints,
+		NodeName:    nodeName,
+		Zone:        zone,
+	}
+}
+
+type makeEndpointFunc func(info *BaseEndpointInfo) Endpoint
+
+type processEndpointsMapChangeFunc func(oldEndpointsMap, newEndpointsMap EndpointsMap)
+
+type EndpointChangeTracker struct {
+	lock sync.Mutex
+	hostname string
+	items map[types.NamespacedName]*endpointsChange
+	makeEndpointInfo          makeEndpointFunc
+	processEndpointsMapChange processEndpointsMapChangeFunc
+	endpointSliceCache *EndpointSliceCache
+	ipFamily v1.IPFamily
+	recorder events.EventRecorder
+	lastChangeTriggerTimes map[types.NamespacedName][]time.Time
+	trackerStartTime time.Time
+}
+
+func NewEndpointChangeTracker(hostname string, makeEndpointInfo makeEndpointFunc, ipFamily v1.IPFamily, recorder events.EventRecorder, processEndpointsMapChange processEndpointsMapChangeFunc) *EndpointChangeTracker {
+	return &EndpointChangeTracker{
+		hostname:                  hostname,
+		items:                     make(map[types.NamespacedName]*endpointsChange),
+		makeEndpointInfo:          makeEndpointInfo,
+		ipFamily:                  ipFamily,
+		recorder:                  recorder,
+		lastChangeTriggerTimes:    make(map[types.NamespacedName][]time.Time),
+		trackerStartTime:          time.Now(),
+		processEndpointsMapChange: processEndpointsMapChange,
+		endpointSliceCache:        NewEndpointSliceCache(hostname, ipFamily, recorder, makeEndpointInfo),
+	}
+}
+
+func (ect *EndpointChangeTracker) Update(previous, current *v1.Endpoints) bool {
+	endpoints := current
+	if endpoints == nil {
+		endpoints = previous
+	}
+	if endpoints == nil {
+		return false
+	}
+	metrics.EndpointChangesTotal.Inc()
+	namespacedName := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
+
+	ect.lock.Lock()
+	defer ect.lock.Unlock()
+
+	change, exists := ect.items[namespacedName]
+	if !exists {
+		change = &endpointsChange{}
+		change.previous = ect.endpointsToEndpointsMap(previous)
+		ect.items[namespacedName] = change
+	}
+
+	if t := getLastChangeTriggerTime(endpoints.Annotations); !t.IsZero() && current != nil && t.After(ect.trackerStartTime) {
+		ect.lastChangeTriggerTimes[namespacedName] = append(ect.lastChangeTriggerTimes[namespacedName], t)
+	}
+
+	change.current = ect.endpointsToEndpointsMap(current)
+	if reflect.DeepEqual(change.previous, change.current) {
+		delete(ect.items, namespacedName)
+		delete(ect.lastChangeTriggerTimes, namespacedName)
+	} else {
+		for spn, eps := range change.current {
+			klog.V(2).InfoS("Service port endpoints update", "servicePort", spn, "endpoints", len(eps))
+		}
+	}
+
+	metrics.EndpointChangesPending.Set(float64(len(ect.items)))
+	return len(ect.items) > 0
+}
+
+func (ect *EndpointChangeTracker) EndpointSliceUpdate(endpointSlice *discovery.EndpointSlice, removeSlice bool) bool {
+	if !supportedEndpointSliceAddressTypes.Has(string(endpointSlice.AddressType)) {
+		klog.V(4).InfoS("EndpointSlice address type not supported by kube-proxy", "addressType", endpointSlice.AddressType)
+		return false
+	}
+
+	if endpointSlice == nil {
+		klog.ErrorS(nil, "Nil endpointSlice passed to EndpointSliceUpdate")
+		return false
+	}
+
+	namespacedName, _, err := endpointSliceCacheKeys(endpointSlice)
+	if err != nil {
+		klog.InfoS("Error getting endpoint slice cache keys", "err", err)
+		return false
+	}
+
+	metrics.EndpointChangesTotal.Inc()
+
+	ect.lock.Lock()
+	defer ect.lock.Unlock()
+
+	changeNeeded := ect.endpointSliceCache.updatePending(endpointSlice, removeSlice)
+
+	if changeNeeded {
+		metrics.EndpointChangesPending.Inc()
+		if t := getLastChangeTriggerTime(endpointSlice.Annotations); !t.IsZero() && !removeSlice && t.After(ect.trackerStartTime) {
+			ect.lastChangeTriggerTimes[namespacedName] =
+				append(ect.lastChangeTriggerTimes[namespacedName], t)
+		}
+	}
+
+	return changeNeeded
+}
+
+func (ect *EndpointChangeTracker) checkoutChanges() []*endpointsChange {
+	ect.lock.Lock()
+	defer ect.lock.Unlock()
+
+	metrics.EndpointChangesPending.Set(0)
+
+	if ect.endpointSliceCache != nil {
+		return ect.endpointSliceCache.checkoutChanges()
+	}
+
+	changes := []*endpointsChange{}
+	for _, change := range ect.items {
+		changes = append(changes, change)
+	}
+	ect.items = make(map[types.NamespacedName]*endpointsChange)
+	return changes
+}
+
+func (ect *EndpointChangeTracker) checkoutTriggerTimes(lastChangeTriggerTimes *map[types.NamespacedName][]time.Time) {
+	ect.lock.Lock()
+	defer ect.lock.Unlock()
+
+	for k, v := range ect.lastChangeTriggerTimes {
+		prev, ok := (*lastChangeTriggerTimes)[k]
+		if !ok {
+			(*lastChangeTriggerTimes)[k] = v
+		} else {
+			(*lastChangeTriggerTimes)[k] = append(prev, v...)
+		}
+	}
+	ect.lastChangeTriggerTimes = make(map[types.NamespacedName][]time.Time)
+}
+
+func getLastChangeTriggerTime(annotations map[string]string) time.Time {
+	if _, ok := annotations[v1.EndpointsLastChangeTriggerTime]; !ok {
+		return time.Time{}
+	}
+	val, err := time.Parse(time.RFC3339Nano, annotations[v1.EndpointsLastChangeTriggerTime])
+	if err != nil {
+		klog.ErrorS(err, "Error while parsing EndpointsLastChangeTriggerTimeAnnotation",
+			"value", annotations[v1.EndpointsLastChangeTriggerTime])
+	}
+	return val
+}
+
+type endpointsChange struct {
+	previous EndpointsMap
+	current  EndpointsMap
+}
+
+type UpdateEndpointMapResult struct {
+	HCEndpointsLocalIPSize map[types.NamespacedName]int
+	StaleEndpoints []ServiceEndpoint
+	StaleServiceNames []ServicePortName
+	LastChangeTriggerTimes map[types.NamespacedName][]time.Time
+}
+
+func (em EndpointsMap) Update(changes *EndpointChangeTracker) (result UpdateEndpointMapResult) {
+	result.StaleEndpoints = make([]ServiceEndpoint, 0)
+	result.StaleServiceNames = make([]ServicePortName, 0)
+	result.LastChangeTriggerTimes = make(map[types.NamespacedName][]time.Time)
+
+	em.apply(
+		changes, &result.StaleEndpoints, &result.StaleServiceNames, &result.LastChangeTriggerTimes)
+
+	result.HCEndpointsLocalIPSize = make(map[types.NamespacedName]int)
+	localIPs := em.getLocalReadyEndpointIPs()
+	for nsn, ips := range localIPs {
+		result.HCEndpointsLocalIPSize[nsn] = len(ips)
+	}
+
+	return result
+}
+
+type EndpointsMap map[ServicePortName][]Endpoint
+
+func (ect *EndpointChangeTracker) endpointsToEndpointsMap(endpoints *v1.Endpoints) EndpointsMap {
+	if endpoints == nil {
+		return nil
+	}
+
+	endpointsMap := make(EndpointsMap)
+	for i := range endpoints.Subsets {
+		ss := &endpoints.Subsets[i]
+		for i := range ss.Ports {
+			port := &ss.Ports[i]
+			if port.Port == 0 {
+				klog.ErrorS(nil, "Ignoring invalid endpoint port", "portName", port.Name)
+				continue
+			}
+			svcPortName := ServicePortName{
+				NamespacedName: types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name},
+				Port:           port.Name,
+				Protocol:       port.Protocol,
+			}
+			for i := range ss.Addresses {
+				addr := &ss.Addresses[i]
+				if addr.IP == "" {
+					klog.ErrorS(nil, "Ignoring invalid endpoint port with empty host", "portName", port.Name)
+					continue
+				}
+
+				if (ect.ipFamily == v1.IPv6Protocol) != utilnet.IsIPv6String(addr.IP) {
+					utilproxy.LogAndEmitIncorrectIPVersionEvent(ect.recorder, "endpoints", addr.IP, endpoints.Namespace, endpoints.Name, "")
+					continue
+				}
+
+				isReady := true
+				isServing := true
+				isTerminating := false
+				isLocal := false
+				nodeName := ""
+				if addr.NodeName != nil {
+					isLocal = *addr.NodeName == ect.hostname
+					nodeName = *addr.NodeName
+				}
+				zoneHints := sets.String{}
+
+				baseEndpointInfo := newBaseEndpointInfo(addr.IP, nodeName, "", int(port.Port), isLocal, isReady, isServing, isTerminating, zoneHints)
+				if ect.makeEndpointInfo != nil {
+					endpointsMap[svcPortName] = append(endpointsMap[svcPortName], ect.makeEndpointInfo(baseEndpointInfo))
+				} else {
+					endpointsMap[svcPortName] = append(endpointsMap[svcPortName], baseEndpointInfo)
+				}
+			}
+
+			klog.V(3).InfoS("Setting endpoints for service port", "portName", svcPortName, "endpoints", formatEndpointsList(endpointsMap[svcPortName]))
+		}
+	}
+	return endpointsMap
+}
+
+func (em EndpointsMap) apply(ect *EndpointChangeTracker, staleEndpoints *[]ServiceEndpoint,
+	staleServiceNames *[]ServicePortName, lastChangeTriggerTimes *map[types.NamespacedName][]time.Time) {
+	if ect == nil {
+		return
+	}
+
+	changes := ect.checkoutChanges()
+	for _, change := range changes {
+		if ect.processEndpointsMapChange != nil {
+			ect.processEndpointsMapChange(change.previous, change.current)
+		}
+		em.unmerge(change.previous)
+		em.merge(change.current)
+		detectStaleConnections(change.previous, change.current, staleEndpoints, staleServiceNames)
+	}
+	ect.checkoutTriggerTimes(lastChangeTriggerTimes)
+}
+
+func (em EndpointsMap) merge(other EndpointsMap) {
+	for svcPortName := range other {
+		em[svcPortName] = other[svcPortName]
+	}
+}
+
+func (em EndpointsMap) unmerge(other EndpointsMap) {
+	for svcPortName := range other {
+		delete(em, svcPortName)
+	}
+}
+
+func (em EndpointsMap) getLocalReadyEndpointIPs() map[types.NamespacedName]sets.String {
+	localIPs := make(map[types.NamespacedName]sets.String)
+	for svcPortName, epList := range em {
+		for _, ep := range epList {
+			if !ep.IsReady() {
+				continue
+			}
+
+			if ep.GetIsLocal() {
+				nsn := svcPortName.NamespacedName
+				if localIPs[nsn] == nil {
+					localIPs[nsn] = sets.NewString()
+				}
+				localIPs[nsn].Insert(ep.IP())
+			}
+		}
+	}
+	return localIPs
+}
+
+func detectStaleConnections(oldEndpointsMap, newEndpointsMap EndpointsMap, staleEndpoints *[]ServiceEndpoint, staleServiceNames *[]ServicePortName) {
+	for svcPortName, epList := range oldEndpointsMap {
+		if svcPortName.Protocol != v1.ProtocolUDP {
+			continue
+		}
+
+		for _, ep := range epList {
+			if !ep.IsReady() {
+				continue
+			}
+			stale := true
+			for i := range newEndpointsMap[svcPortName] {
+				if newEndpointsMap[svcPortName][i].Equal(ep) {
+					stale = false
+					break
+				}
+			}
+			if stale {
+				klog.V(4).InfoS("Stale endpoint", "portName", svcPortName, "endpoint", ep)
+				*staleEndpoints = append(*staleEndpoints, ServiceEndpoint{Endpoint: ep.String(), ServicePortName: svcPortName})
+			}
+		}
+	}
+
+	for svcPortName, epList := range newEndpointsMap {
+		if svcPortName.Protocol != v1.ProtocolUDP {
+			continue
+		}
+
+		epReady := 0
+		for _, ep := range epList {
+			if ep.IsReady() {
+				epReady++
+			}
+		}
+
+		oldEpReady := 0
+		for _, ep := range oldEndpointsMap[svcPortName] {
+			if ep.IsReady() {
+				oldEpReady++
+			}
+		}
+
+		if epReady > 0 && oldEpReady == 0 {
+			*staleServiceNames = append(*staleServiceNames, svcPortName)
+		}
+	}
+}

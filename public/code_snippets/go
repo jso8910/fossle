@@ -1,0 +1,1145 @@
+package constant
+
+import (
+	"fmt"
+	"go/token"
+	"math"
+	"math/big"
+	"math/bits"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode/utf8"
+)
+
+type Kind int
+
+const (
+	Unknown Kind = iota
+
+	Bool
+	String
+
+	Int
+	Float
+	Complex
+)
+
+type Value interface {
+	Kind() Kind
+	String() string
+
+	ExactString() string
+
+	implementsValue()
+}
+
+const prec = 512
+
+type (
+	unknownVal struct{}
+	boolVal    bool
+	stringVal  struct {
+		mu   sync.Mutex
+		s    string
+		l, r *stringVal
+	}
+	int64Val   int64                    
+	intVal     struct{ val *big.Int } 
+	ratVal     struct{ val *big.Rat }   
+	floatVal   struct{ val *big.Float }
+	complexVal struct{ re, im Value }
+)
+
+func (unknownVal) Kind() Kind { return Unknown }
+func (boolVal) Kind() Kind    { return Bool }
+func (*stringVal) Kind() Kind { return String }
+func (int64Val) Kind() Kind   { return Int }
+func (intVal) Kind() Kind     { return Int }
+func (ratVal) Kind() Kind     { return Float }
+func (floatVal) Kind() Kind   { return Float }
+func (complexVal) Kind() Kind { return Complex }
+
+func (unknownVal) String() string { return "unknown" }
+func (x boolVal) String() string  { return strconv.FormatBool(bool(x)) }
+
+func (x *stringVal) String() string {
+	const maxLen = 72
+	s := strconv.Quote(x.string())
+	if utf8.RuneCountInString(s) > maxLen {
+		i := 0
+		for n := 0; n < maxLen-3; n++ {
+			_, size := utf8.DecodeRuneInString(s[i:])
+			i += size
+		}
+		s = s[:i] + "..."
+	}
+	return s
+}
+
+func (x *stringVal) string() string {
+	x.mu.Lock()
+	if x.l != nil {
+		x.s = strings.Join(reverse(x.appendReverse(nil)), "")
+		x.l = nil
+		x.r = nil
+	}
+	s := x.s
+	x.mu.Unlock()
+
+	return s
+}
+
+func reverse(x []string) []string {
+	n := len(x)
+	for i := 0; i+i < n; i++ {
+		x[i], x[n-1-i] = x[n-1-i], x[i]
+	}
+	return x
+}
+
+func (x *stringVal) appendReverse(list []string) []string {
+	y := x
+	for y.r != nil {
+		y.r.mu.Lock()
+		list = y.r.appendReverse(list)
+		y.r.mu.Unlock()
+
+		l := y.l
+		if y != x {
+			y.mu.Unlock()
+		}
+		l.mu.Lock()
+		y = l
+	}
+	s := y.s
+	if y != x {
+		y.mu.Unlock()
+	}
+	return append(list, s)
+}
+
+func (x int64Val) String() string { return strconv.FormatInt(int64(x), 10) }
+func (x intVal) String() string   { return x.val.String() }
+func (x ratVal) String() string   { return rtof(x).String() }
+
+func (x floatVal) String() string {
+	f := x.val
+
+	if f.IsInf() {
+		return f.String()
+	}
+
+	if x, _ := f.Float64(); f.Sign() == 0 == (x == 0) && !math.IsInf(x, 0) {
+		return fmt.Sprintf("%.6g", x)
+	}
+
+	var mant big.Float
+	exp := f.MantExp(&mant)
+
+	m, _ := mant.Float64()                    
+	d := float64(exp) * (math.Ln2 / math.Ln10)
+
+	e := int64(d)
+	m *= math.Pow(10, d-float64(e))
+
+	switch am := math.Abs(m); {
+	case am < 1-0.5e-6:
+		m *= 10
+		e--
+	case am >= 10:
+		m /= 10
+		e++
+	}
+
+	return fmt.Sprintf("%.6ge%+d", m, e)
+}
+
+func (x complexVal) String() string { return fmt.Sprintf("(%s + %si)", x.re, x.im) }
+
+func (x unknownVal) ExactString() string { return x.String() }
+func (x boolVal) ExactString() string    { return x.String() }
+func (x *stringVal) ExactString() string { return strconv.Quote(x.string()) }
+func (x int64Val) ExactString() string   { return x.String() }
+func (x intVal) ExactString() string     { return x.String() }
+
+func (x ratVal) ExactString() string {
+	r := x.val
+	if r.IsInt() {
+		return r.Num().String()
+	}
+	return r.String()
+}
+
+func (x floatVal) ExactString() string { return x.val.Text('p', 0) }
+
+func (x complexVal) ExactString() string {
+	return fmt.Sprintf("(%s + %si)", x.re.ExactString(), x.im.ExactString())
+}
+
+func (unknownVal) implementsValue() {}
+func (boolVal) implementsValue()    {}
+func (*stringVal) implementsValue() {}
+func (int64Val) implementsValue()   {}
+func (ratVal) implementsValue()     {}
+func (intVal) implementsValue()     {}
+func (floatVal) implementsValue()   {}
+func (complexVal) implementsValue() {}
+
+func newInt() *big.Int     { return new(big.Int) }
+func newRat() *big.Rat     { return new(big.Rat) }
+func newFloat() *big.Float { return new(big.Float).SetPrec(prec) }
+
+func i64toi(x int64Val) intVal   { return intVal{newInt().SetInt64(int64(x))} }
+func i64tor(x int64Val) ratVal   { return ratVal{newRat().SetInt64(int64(x))} }
+func i64tof(x int64Val) floatVal { return floatVal{newFloat().SetInt64(int64(x))} }
+func itor(x intVal) ratVal       { return ratVal{newRat().SetInt(x.val)} }
+func itof(x intVal) floatVal     { return floatVal{newFloat().SetInt(x.val)} }
+func rtof(x ratVal) floatVal     { return floatVal{newFloat().SetRat(x.val)} }
+func vtoc(x Value) complexVal    { return complexVal{x, int64Val(0)} }
+
+func makeInt(x *big.Int) Value {
+	if x.IsInt64() {
+		return int64Val(x.Int64())
+	}
+	return intVal{x}
+}
+
+func makeRat(x *big.Rat) Value {
+	a := x.Num()
+	b := x.Denom()
+	if smallInt(a) && smallInt(b) {
+		return ratVal{x}
+	}
+	return floatVal{newFloat().SetRat(x)}
+}
+
+var floatVal0 = floatVal{newFloat()}
+
+func makeFloat(x *big.Float) Value {
+	if x.Sign() == 0 {
+		return floatVal0
+	}
+	if x.IsInf() {
+		return unknownVal{}
+	}
+
+	return floatVal{x}
+}
+
+func makeComplex(re, im Value) Value {
+	if re.Kind() == Unknown || im.Kind() == Unknown {
+		return unknownVal{}
+	}
+	return complexVal{re, im}
+}
+
+func makeFloatFromLiteral(lit string) Value {
+	if f, ok := newFloat().SetString(lit); ok {
+		if smallFloat(f) {
+			if f.Sign() == 0 {
+
+				lit = "0"
+			}
+			if r, ok := newRat().SetString(lit); ok {
+				return ratVal{r}
+			}
+		}
+		return makeFloat(f)
+	}
+	return nil
+}
+
+const maxExp = 4 << 10
+
+func smallInt(x *big.Int) bool {
+	return x.BitLen() < maxExp
+}
+
+func smallFloat64(x float64) bool {
+	if math.IsInf(x, 0) {
+		return false
+	}
+	_, e := math.Frexp(x)
+	return -maxExp < e && e < maxExp
+}
+
+func smallFloat(x *big.Float) bool {
+	if x.IsInf() {
+		return false
+	}
+	e := x.MantExp(nil)
+	return -maxExp < e && e < maxExp
+}
+
+func MakeUnknown() Value { return unknownVal{} }
+
+func MakeBool(b bool) Value { return boolVal(b) }
+
+func MakeString(s string) Value { return &stringVal{s: s} }
+
+func MakeInt64(x int64) Value { return int64Val(x) }
+
+func MakeUint64(x uint64) Value {
+	if x < 1<<63 {
+		return int64Val(int64(x))
+	}
+	return intVal{newInt().SetUint64(x)}
+}
+
+func MakeFloat64(x float64) Value {
+	if math.IsInf(x, 0) || math.IsNaN(x) {
+		return unknownVal{}
+	}
+	if smallFloat64(x) {
+		return ratVal{newRat().SetFloat64(x + 0)}
+	}
+	return floatVal{newFloat().SetFloat64(x + 0)}
+}
+
+func MakeFromLiteral(lit string, tok token.Token, zero uint) Value {
+	if zero != 0 {
+		panic("MakeFromLiteral called with non-zero last argument")
+	}
+
+	switch tok {
+	case token.INT:
+		if x, err := strconv.ParseInt(lit, 0, 64); err == nil {
+			return int64Val(x)
+		}
+		if x, ok := newInt().SetString(lit, 0); ok {
+			return intVal{x}
+		}
+
+	case token.FLOAT:
+		if x := makeFloatFromLiteral(lit); x != nil {
+			return x
+		}
+
+	case token.IMAG:
+		if n := len(lit); n > 0 && lit[n-1] == 'i' {
+			if im := makeFloatFromLiteral(lit[:n-1]); im != nil {
+				return makeComplex(int64Val(0), im)
+			}
+		}
+
+	case token.CHAR:
+		if n := len(lit); n >= 2 {
+			if code, _, _, err := strconv.UnquoteChar(lit[1:n-1], '\''); err == nil {
+				return MakeInt64(int64(code))
+			}
+		}
+
+	case token.STRING:
+		if s, err := strconv.Unquote(lit); err == nil {
+			return MakeString(s)
+		}
+
+	default:
+		panic(fmt.Sprintf("%v is not a valid token", tok))
+	}
+
+	return unknownVal{}
+}
+
+
+func BoolVal(x Value) bool {
+	switch x := x.(type) {
+	case boolVal:
+		return bool(x)
+	case unknownVal:
+		return false
+	default:
+		panic(fmt.Sprintf("%v not a Bool", x))
+	}
+}
+
+func StringVal(x Value) string {
+	switch x := x.(type) {
+	case *stringVal:
+		return x.string()
+	case unknownVal:
+		return ""
+	default:
+		panic(fmt.Sprintf("%v not a String", x))
+	}
+}
+
+func Int64Val(x Value) (int64, bool) {
+	switch x := x.(type) {
+	case int64Val:
+		return int64(x), true
+	case intVal:
+		return x.val.Int64(), false
+	case unknownVal:
+		return 0, false
+	default:
+		panic(fmt.Sprintf("%v not an Int", x))
+	}
+}
+
+func Uint64Val(x Value) (uint64, bool) {
+	switch x := x.(type) {
+	case int64Val:
+		return uint64(x), x >= 0
+	case intVal:
+		return x.val.Uint64(), x.val.IsUint64()
+	case unknownVal:
+		return 0, false
+	default:
+		panic(fmt.Sprintf("%v not an Int", x))
+	}
+}
+
+func Float32Val(x Value) (float32, bool) {
+	switch x := x.(type) {
+	case int64Val:
+		f := float32(x)
+		return f, int64Val(f) == x
+	case intVal:
+		f, acc := newFloat().SetInt(x.val).Float32()
+		return f, acc == big.Exact
+	case ratVal:
+		return x.val.Float32()
+	case floatVal:
+		f, acc := x.val.Float32()
+		return f, acc == big.Exact
+	case unknownVal:
+		return 0, false
+	default:
+		panic(fmt.Sprintf("%v not a Float", x))
+	}
+}
+
+func Float64Val(x Value) (float64, bool) {
+	switch x := x.(type) {
+	case int64Val:
+		f := float64(int64(x))
+		return f, int64Val(f) == x
+	case intVal:
+		f, acc := newFloat().SetInt(x.val).Float64()
+		return f, acc == big.Exact
+	case ratVal:
+		return x.val.Float64()
+	case floatVal:
+		f, acc := x.val.Float64()
+		return f, acc == big.Exact
+	case unknownVal:
+		return 0, false
+	default:
+		panic(fmt.Sprintf("%v not a Float", x))
+	}
+}
+
+func Val(x Value) any {
+	switch x := x.(type) {
+	case boolVal:
+		return bool(x)
+	case *stringVal:
+		return x.string()
+	case int64Val:
+		return int64(x)
+	case intVal:
+		return x.val
+	case ratVal:
+		return x.val
+	case floatVal:
+		return x.val
+	default:
+		return nil
+	}
+}
+
+func Make(x any) Value {
+	switch x := x.(type) {
+	case bool:
+		return boolVal(x)
+	case string:
+		return &stringVal{s: x}
+	case int64:
+		return int64Val(x)
+	case *big.Int:
+		return makeInt(x)
+	case *big.Rat:
+		return makeRat(x)
+	case *big.Float:
+		return makeFloat(x)
+	default:
+		return unknownVal{}
+	}
+}
+
+func BitLen(x Value) int {
+	switch x := x.(type) {
+	case int64Val:
+		u := uint64(x)
+		if x < 0 {
+			u = uint64(-x)
+		}
+		return 64 - bits.LeadingZeros64(u)
+	case intVal:
+		return x.val.BitLen()
+	case unknownVal:
+		return 0
+	default:
+		panic(fmt.Sprintf("%v not an Int", x))
+	}
+}
+
+func Sign(x Value) int {
+	switch x := x.(type) {
+	case int64Val:
+		switch {
+		case x < 0:
+			return -1
+		case x > 0:
+			return 1
+		}
+		return 0
+	case intVal:
+		return x.val.Sign()
+	case ratVal:
+		return x.val.Sign()
+	case floatVal:
+		return x.val.Sign()
+	case complexVal:
+		return Sign(x.re) | Sign(x.im)
+	case unknownVal:
+		return 1
+	default:
+		panic(fmt.Sprintf("%v not numeric", x))
+	}
+}
+
+const (
+	_m       = ^big.Word(0)
+	_log     = _m>>8&1 + _m>>16&1 + _m>>32&1
+	wordSize = 1 << _log
+)
+
+func Bytes(x Value) []byte {
+	var t intVal
+	switch x := x.(type) {
+	case int64Val:
+		t = i64toi(x)
+	case intVal:
+		t = x
+	default:
+		panic(fmt.Sprintf("%v not an Int", x))
+	}
+
+	words := t.val.Bits()
+	bytes := make([]byte, len(words)*wordSize)
+
+	i := 0
+	for _, w := range words {
+		for j := 0; j < wordSize; j++ {
+			bytes[i] = byte(w)
+			w >>= 8
+			i++
+		}
+	}
+	for i > 0 && bytes[i-1] == 0 {
+		i--
+	}
+
+	return bytes[:i]
+}
+
+func MakeFromBytes(bytes []byte) Value {
+	words := make([]big.Word, (len(bytes)+(wordSize-1))/wordSize)
+
+	i := 0
+	var w big.Word
+	var s uint
+	for _, b := range bytes {
+		w |= big.Word(b) << s
+		if s += 8; s == wordSize*8 {
+			words[i] = w
+			i++
+			w = 0
+			s = 0
+		}
+	}
+	if i < len(words) {
+		words[i] = w
+		i++
+	}
+	for i > 0 && words[i-1] == 0 {
+		i--
+	}
+
+	return makeInt(newInt().SetBits(words[:i]))
+}
+
+func Num(x Value) Value {
+	switch x := x.(type) {
+	case int64Val, intVal:
+		return x
+	case ratVal:
+		return makeInt(x.val.Num())
+	case floatVal:
+		if smallFloat(x.val) {
+			r, _ := x.val.Rat(nil)
+			return makeInt(r.Num())
+		}
+	case unknownVal:
+		break
+	default:
+		panic(fmt.Sprintf("%v not Int or Float", x))
+	}
+	return unknownVal{}
+}
+
+func Denom(x Value) Value {
+	switch x := x.(type) {
+	case int64Val, intVal:
+		return int64Val(1)
+	case ratVal:
+		return makeInt(x.val.Denom())
+	case floatVal:
+		if smallFloat(x.val) {
+			r, _ := x.val.Rat(nil)
+			return makeInt(r.Denom())
+		}
+	case unknownVal:
+		break
+	default:
+		panic(fmt.Sprintf("%v not Int or Float", x))
+	}
+	return unknownVal{}
+}
+
+func MakeImag(x Value) Value {
+	switch x.(type) {
+	case unknownVal:
+		return x
+	case int64Val, intVal, ratVal, floatVal:
+		return makeComplex(int64Val(0), x)
+	default:
+		panic(fmt.Sprintf("%v not Int or Float", x))
+	}
+}
+
+func Real(x Value) Value {
+	switch x := x.(type) {
+	case unknownVal, int64Val, intVal, ratVal, floatVal:
+		return x
+	case complexVal:
+		return x.re
+	default:
+		panic(fmt.Sprintf("%v not numeric", x))
+	}
+}
+
+func Imag(x Value) Value {
+	switch x := x.(type) {
+	case unknownVal:
+		return x
+	case int64Val, intVal, ratVal, floatVal:
+		return int64Val(0)
+	case complexVal:
+		return x.im
+	default:
+		panic(fmt.Sprintf("%v not numeric", x))
+	}
+}
+
+func ToInt(x Value) Value {
+	switch x := x.(type) {
+	case int64Val, intVal:
+		return x
+
+	case ratVal:
+		if x.val.IsInt() {
+			return makeInt(x.val.Num())
+		}
+
+	case floatVal:
+		if smallFloat(x.val) {
+			i := newInt()
+			if _, acc := x.val.Int(i); acc == big.Exact {
+				return makeInt(i)
+			}
+
+			const delta = 4
+			var t big.Float
+			t.SetPrec(prec - delta)
+
+			t.SetMode(big.ToZero)
+			t.Set(x.val)
+			if _, acc := t.Int(i); acc == big.Exact {
+				return makeInt(i)
+			}
+
+			t.SetMode(big.AwayFromZero)
+			t.Set(x.val)
+			if _, acc := t.Int(i); acc == big.Exact {
+				return makeInt(i)
+			}
+		}
+
+	case complexVal:
+		if re := ToFloat(x); re.Kind() == Float {
+			return ToInt(re)
+		}
+	}
+
+	return unknownVal{}
+}
+
+func ToFloat(x Value) Value {
+	switch x := x.(type) {
+	case int64Val:
+		return i64tor(x)
+	case intVal:
+		if smallInt(x.val) {
+			return itor(x)
+		}
+		return itof(x)
+	case ratVal, floatVal:
+		return x
+	case complexVal:
+		if Sign(x.im) == 0 {
+			return ToFloat(x.re)
+		}
+	}
+	return unknownVal{}
+}
+
+func ToComplex(x Value) Value {
+	switch x := x.(type) {
+	case int64Val, intVal, ratVal, floatVal:
+		return vtoc(x)
+	case complexVal:
+		return x
+	}
+	return unknownVal{}
+}
+
+func is32bit(x int64) bool {
+	const s = 32
+	return -1<<(s-1) <= x && x <= 1<<(s-1)-1
+}
+
+func is63bit(x int64) bool {
+	const s = 63
+	return -1<<(s-1) <= x && x <= 1<<(s-1)-1
+}
+
+func UnaryOp(op token.Token, y Value, prec uint) Value {
+	switch op {
+	case token.ADD:
+		switch y.(type) {
+		case unknownVal, int64Val, intVal, ratVal, floatVal, complexVal:
+			return y
+		}
+
+	case token.SUB:
+		switch y := y.(type) {
+		case unknownVal:
+			return y
+		case int64Val:
+			if z := -y; z != y {
+				return z
+			}
+			return makeInt(newInt().Neg(big.NewInt(int64(y))))
+		case intVal:
+			return makeInt(newInt().Neg(y.val))
+		case ratVal:
+			return makeRat(newRat().Neg(y.val))
+		case floatVal:
+			return makeFloat(newFloat().Neg(y.val))
+		case complexVal:
+			re := UnaryOp(token.SUB, y.re, 0)
+			im := UnaryOp(token.SUB, y.im, 0)
+			return makeComplex(re, im)
+		}
+
+	case token.XOR:
+		z := newInt()
+		switch y := y.(type) {
+		case unknownVal:
+			return y
+		case int64Val:
+			z.Not(big.NewInt(int64(y)))
+		case intVal:
+			z.Not(y.val)
+		default:
+			goto Error
+		}
+		if prec > 0 {
+			z.AndNot(z, newInt().Lsh(big.NewInt(-1), prec))
+		}
+		return makeInt(z)
+
+	case token.NOT:
+		switch y := y.(type) {
+		case unknownVal:
+			return y
+		case boolVal:
+			return !y
+		}
+	}
+
+Error:
+	panic(fmt.Sprintf("invalid unary operation %s%v", op, y))
+}
+
+func ord(x Value) int {
+	switch x.(type) {
+	default:
+		return -1
+	case unknownVal:
+		return 0
+	case boolVal, *stringVal:
+		return 1
+	case int64Val:
+		return 2
+	case intVal:
+		return 3
+	case ratVal:
+		return 4
+	case floatVal:
+		return 5
+	case complexVal:
+		return 6
+	}
+}
+func match(x, y Value) (_, _ Value) {
+	switch ox, oy := ord(x), ord(y); {
+	case ox < oy:
+		x, y = match0(x, y)
+	case ox > oy:
+		y, x = match0(y, x)
+	}
+	return x, y
+}
+
+func match0(x, y Value) (_, _ Value) {
+
+	switch y.(type) {
+	case intVal:
+		switch x1 := x.(type) {
+		case int64Val:
+			return i64toi(x1), y
+		}
+	case ratVal:
+		switch x1 := x.(type) {
+		case int64Val:
+			return i64tor(x1), y
+		case intVal:
+			return itor(x1), y
+		}
+	case floatVal:
+		switch x1 := x.(type) {
+		case int64Val:
+			return i64tof(x1), y
+		case intVal:
+			return itof(x1), y
+		case ratVal:
+			return rtof(x1), y
+		}
+	case complexVal:
+		return vtoc(x), y
+	}
+
+	return x, x
+}
+
+func BinaryOp(x_ Value, op token.Token, y_ Value) Value {
+	x, y := match(x_, y_)
+
+	switch x := x.(type) {
+	case unknownVal:
+		return x
+
+	case boolVal:
+		y := y.(boolVal)
+		switch op {
+		case token.LAND:
+			return x && y
+		case token.LOR:
+			return x || y
+		}
+
+	case int64Val:
+		a := int64(x)
+		b := int64(y.(int64Val))
+		var c int64
+		switch op {
+		case token.ADD:
+			if !is63bit(a) || !is63bit(b) {
+				return makeInt(newInt().Add(big.NewInt(a), big.NewInt(b)))
+			}
+			c = a + b
+		case token.SUB:
+			if !is63bit(a) || !is63bit(b) {
+				return makeInt(newInt().Sub(big.NewInt(a), big.NewInt(b)))
+			}
+			c = a - b
+		case token.MUL:
+			if !is32bit(a) || !is32bit(b) {
+				return makeInt(newInt().Mul(big.NewInt(a), big.NewInt(b)))
+			}
+			c = a * b
+		case token.QUO:
+			return makeRat(big.NewRat(a, b))
+		case token.QUO_ASSIGN:
+			c = a / b
+		case token.REM:
+			c = a % b
+		case token.AND:
+			c = a & b
+		case token.OR:
+			c = a | b
+		case token.XOR:
+			c = a ^ b
+		case token.AND_NOT:
+			c = a &^ b
+		default:
+			goto Error
+		}
+		return int64Val(c)
+
+	case intVal:
+		a := x.val
+		b := y.(intVal).val
+		c := newInt()
+		switch op {
+		case token.ADD:
+			c.Add(a, b)
+		case token.SUB:
+			c.Sub(a, b)
+		case token.MUL:
+			c.Mul(a, b)
+		case token.QUO:
+			return makeRat(newRat().SetFrac(a, b))
+		case token.QUO_ASSIGN:
+			c.Quo(a, b)
+		case token.REM:
+			c.Rem(a, b)
+		case token.AND:
+			c.And(a, b)
+		case token.OR:
+			c.Or(a, b)
+		case token.XOR:
+			c.Xor(a, b)
+		case token.AND_NOT:
+			c.AndNot(a, b)
+		default:
+			goto Error
+		}
+		return makeInt(c)
+
+	case ratVal:
+		a := x.val
+		b := y.(ratVal).val
+		c := newRat()
+		switch op {
+		case token.ADD:
+			c.Add(a, b)
+		case token.SUB:
+			c.Sub(a, b)
+		case token.MUL:
+			c.Mul(a, b)
+		case token.QUO:
+			c.Quo(a, b)
+		default:
+			goto Error
+		}
+		return makeRat(c)
+
+	case floatVal:
+		a := x.val
+		b := y.(floatVal).val
+		c := newFloat()
+		switch op {
+		case token.ADD:
+			c.Add(a, b)
+		case token.SUB:
+			c.Sub(a, b)
+		case token.MUL:
+			c.Mul(a, b)
+		case token.QUO:
+			c.Quo(a, b)
+		default:
+			goto Error
+		}
+		return makeFloat(c)
+
+	case complexVal:
+		y := y.(complexVal)
+		a, b := x.re, x.im
+		c, d := y.re, y.im
+		var re, im Value
+		switch op {
+		case token.ADD:
+			re = add(a, c)
+			im = add(b, d)
+		case token.SUB:
+			re = sub(a, c)
+			im = sub(b, d)
+		case token.MUL:
+			ac := mul(a, c)
+			bd := mul(b, d)
+			bc := mul(b, c)
+			ad := mul(a, d)
+			re = sub(ac, bd)
+			im = add(bc, ad)
+		case token.QUO:
+			ac := mul(a, c)
+			bd := mul(b, d)
+			bc := mul(b, c)
+			ad := mul(a, d)
+			cc := mul(c, c)
+			dd := mul(d, d)
+			s := add(cc, dd)
+			re = add(ac, bd)
+			re = quo(re, s)
+			im = sub(bc, ad)
+			im = quo(im, s)
+		default:
+			goto Error
+		}
+		return makeComplex(re, im)
+
+	case *stringVal:
+		if op == token.ADD {
+			return &stringVal{l: x, r: y.(*stringVal)}
+		}
+	}
+
+Error:
+	panic(fmt.Sprintf("invalid binary operation %v %s %v", x_, op, y_))
+}
+
+func add(x, y Value) Value { return BinaryOp(x, token.ADD, y) }
+func sub(x, y Value) Value { return BinaryOp(x, token.SUB, y) }
+func mul(x, y Value) Value { return BinaryOp(x, token.MUL, y) }
+func quo(x, y Value) Value { return BinaryOp(x, token.QUO, y) }
+func Shift(x Value, op token.Token, s uint) Value {
+	switch x := x.(type) {
+	case unknownVal:
+		return x
+
+	case int64Val:
+		if s == 0 {
+			return x
+		}
+		switch op {
+		case token.SHL:
+			z := i64toi(x).val
+			return makeInt(z.Lsh(z, s))
+		case token.SHR:
+			return x >> s
+		}
+
+	case intVal:
+		if s == 0 {
+			return x
+		}
+		z := newInt()
+		switch op {
+		case token.SHL:
+			return makeInt(z.Lsh(x.val, s))
+		case token.SHR:
+			return makeInt(z.Rsh(x.val, s))
+		}
+	}
+
+	panic(fmt.Sprintf("invalid shift %v %s %d", x, op, s))
+}
+
+func cmpZero(x int, op token.Token) bool {
+	switch op {
+	case token.EQL:
+		return x == 0
+	case token.NEQ:
+		return x != 0
+	case token.LSS:
+		return x < 0
+	case token.LEQ:
+		return x <= 0
+	case token.GTR:
+		return x > 0
+	case token.GEQ:
+		return x >= 0
+	}
+	panic(fmt.Sprintf("invalid comparison %v %s 0", x, op))
+}
+
+func Compare(x_ Value, op token.Token, y_ Value) bool {
+	x, y := match(x_, y_)
+
+	switch x := x.(type) {
+	case unknownVal:
+		return false
+
+	case boolVal:
+		y := y.(boolVal)
+		switch op {
+		case token.EQL:
+			return x == y
+		case token.NEQ:
+			return x != y
+		}
+
+	case int64Val:
+		y := y.(int64Val)
+		switch op {
+		case token.EQL:
+			return x == y
+		case token.NEQ:
+			return x != y
+		case token.LSS:
+			return x < y
+		case token.LEQ:
+			return x <= y
+		case token.GTR:
+			return x > y
+		case token.GEQ:
+			return x >= y
+		}
+
+	case intVal:
+		return cmpZero(x.val.Cmp(y.(intVal).val), op)
+
+	case ratVal:
+		return cmpZero(x.val.Cmp(y.(ratVal).val), op)
+
+	case floatVal:
+		return cmpZero(x.val.Cmp(y.(floatVal).val), op)
+
+	case complexVal:
+		y := y.(complexVal)
+		re := Compare(x.re, token.EQL, y.re)
+		im := Compare(x.im, token.EQL, y.im)
+		switch op {
+		case token.EQL:
+			return re && im
+		case token.NEQ:
+			return !re || !im
+		}
+
+	case *stringVal:
+		xs := x.string()
+		ys := y.(*stringVal).string()
+		switch op {
+		case token.EQL:
+			return xs == ys
+		case token.NEQ:
+			return xs != ys
+		case token.LSS:
+			return xs < ys
+		case token.LEQ:
+			return xs <= ys
+		case token.GTR:
+			return xs > ys
+		case token.GEQ:
+			return xs >= ys
+		}
+	}
+
+	panic(fmt.Sprintf("invalid comparison %v %s %v", x_, op, y_))
+}
