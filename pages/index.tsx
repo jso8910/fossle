@@ -56,7 +56,7 @@ interface Info {
   stats: Stats
 }
 
-const isUser = (o: any) : o is Info => {
+const isInfo = (o: any) : o is Info => {
   const i: Info = o
   const boolGuessState = i.guessState.map(guess => guess === -1 || guess === 0 || guess === 1).every(correct => correct)
   const boolStats = ['1', '2', '3', '4', '5', '6', '7', 'lost'].map(key => typeof i.stats[key as keyof Stats] === 'number').every(correct => correct)
@@ -77,40 +77,40 @@ const Home: NextPage = () => {
   //   route: 'win/6',
   // });
   let unsortedProjects: LooseObject = { // Format: projectName: file
-    'freeCodeCamp/freeCodeCamp': 'freeCodeCamp', //
-    'vuejs/vue': 'vue', //
-    'facebook/react': 'react', //
-    'tensorflow/tensorflow': 'tensorflow', //
-    'twbs/bootstrap': 'bootstrap', //
-    'ohmyzsh/ohmyzsh': 'ohmyzsh', //
-    'flutter/flutter': 'flutter', //
-    'microsoft/vscode': 'vscode', //
-    'torvalds/linux': 'linux', //
-    'facebook/react-native': 'react-native', //
-    'electron/electron': 'electron', //
-    'golang/go': 'go', //
-    'facebook/create-react-app': 'create-react-app', //
-    'kubernetes/kubernetes': 'kubernetes', //
-    'nodejs/node': 'node', //
-    'vercel/next.js': 'nextjs', //
-    'angular/angular': 'angular', //
-    'mrdoob/three.js': 'threejs', //
-    'microsoft/TypeScript': 'typescript', //
-    'ant-design/ant-design': 'ant-design', //
-    'puppeteer/puppeteer': 'puppeteer', //
-    'mui/material-ui': 'material-ui', //
-    'tensorflow/models': 'tfmodels', //
-    'storybookjs/storybook': 'storybook', //
-    'nvbn/thefuck': 'thefuck', //
-    'rust-lang/rust': 'rust', //
-    'django/django': 'django', //
-    'moby/moby': 'moby', //
-    // 'bitcoin/bitcoin': 'bitcoin',
-    // 'Genymobile/scrcpy': 'scrcpy',
-    // 'webpack/webpack': 'webpack',
-    // 'opencv/opencv': 'opencv',
-    // 'apple/swift': 'swift',
-    // 'elastic/elasticsearch': 'elasticsearch',
+    'freeCodeCamp/freeCodeCamp': 'freeCodeCamp',
+    'vuejs/vue': 'vue',
+    'facebook/react': 'react',
+    'tensorflow/tensorflow': 'tensorflow',
+    'twbs/bootstrap': 'bootstrap',
+    'ohmyzsh/ohmyzsh': 'ohmyzsh',
+    'flutter/flutter': 'flutter',
+    'microsoft/vscode': 'vscode',
+    'torvalds/linux': 'linux',
+    'facebook/react-native': 'react-native',
+    'electron/electron': 'electron',
+    'golang/go': 'go',
+    'facebook/create-react-app': 'create-react-app',
+    'kubernetes/kubernetes': 'kubernetes',
+    'nodejs/node': 'node',
+    'vercel/next.js': 'nextjs',
+    'angular/angular': 'angular',
+    'mrdoob/three.js': 'threejs',
+    'microsoft/TypeScript': 'typescript',
+    'ant-design/ant-design': 'ant-design',
+    'puppeteer/puppeteer': 'puppeteer',
+    'mui/material-ui': 'material-ui',
+    'tensorflow/models': 'tfmodels',
+    'storybookjs/storybook': 'storybook',
+    'nvbn/thefuck': 'thefuck',
+    'rust-lang/rust': 'rust',
+    'django/django': 'django',
+    'moby/moby': 'moby',
+    'bitcoin/bitcoin': 'bitcoin',
+    'Genymobile/scrcpy': 'scrcpy',
+    'webpack/webpack': 'webpack',
+    'opencv/opencv': 'opencv',
+    'apple/swift': 'swift',
+    'elastic/elasticsearch': 'elasticsearch',
     // 'hakimel/reveal.js': 'revealjs',
     // 'netdata/netdata': 'netdata',
     // 'pallets/flask': 'flask',
@@ -540,7 +540,7 @@ const Home: NextPage = () => {
       return
     }
     const decodeObj = JSON.parse(decodedStr)
-    if (isUser(decodeObj)) {
+    if (isInfo(decodeObj)) {
       setStats(decodeObj as Info)
       setImported(true)
       overlayClose('import', undefined)
@@ -568,7 +568,7 @@ const Home: NextPage = () => {
       {/* <hr /> */}
       <div style={{display: "table", margin: "0 auto", marginTop: "5px"}}>
         {Array.from(Array(MAX_GUESSES).keys()).map(item => 
-          <ReactCardFlip isFlipped={guessIsFlipped[item]} flipDirection="vertical" containerStyle={{display: "inline-block"}}>
+          <ReactCardFlip key={item} isFlipped={guessIsFlipped[item]} flipDirection="vertical" containerStyle={{display: "inline-block"}}>
             <div style={{maxHeight: "70px",
                         maxWidth: "70px",
                         height: Math.floor(75/MAX_GUESSES).toString() + 'vw',
@@ -680,10 +680,10 @@ const Home: NextPage = () => {
                     textAlign: 'left',
                     padding: '10px'}}>
             <h3 style={{margin: '0px'}}><VscChromeClose style={{cursor: "pointer"}} /></h3>
-            <p>Simply select the popular open source project that you think today's code is from. There is a new puzzle every day and you have {MAX_GUESSES.toString()} guesses before you fail.</p>
+            <p>Simply select the popular open source project that you think today&apos;s code is from. There is a new puzzle every day and you have {MAX_GUESSES.toString()} guesses before you fail.</p>
             <p>The colors really mean nothing. Yellow means your guess was wrong, gray means no guess has been made for that attempt, and green means you got it right.</p>
             <p>More and more code will slowly reveal itself as you fail.</p>
-            <p>Yeah, this really isn't a complex game so just start playing :)</p>
+            <p>Yeah, this really isn&apos;t a complex game so just start playing :)</p>
           </div>
         </div>
       </div>
