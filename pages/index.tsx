@@ -338,7 +338,7 @@ const Home: NextPage = () => {
     datasets: [
       {
         label: 'Guess Distribution',
-        data: labels.map((i) => i),
+        data: labels.map((i) => 0),
         borderColor: 'rgb(255, 99, 132)', // TODO change this
         backgroundColor: 'rgba(255, 99, 132, 0.5)', // TODO change this
         minBarLength: 28,
