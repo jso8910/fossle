@@ -1,0 +1,276 @@
+def supported_activities():
+    return torch.autograd._supported_activities()
+
+
+class _KinetoProfile(object):
+    def __init__(
+            self,
+            *,
+            activities: Optional[Iterable[ProfilerActivity]] = None,
+            record_shapes: bool = False,
+            profile_memory: bool = False,
+            with_stack: bool = False,
+            with_flops: bool = False,
+            with_modules: bool = False):
+        self.activities = set(activities) if activities else supported_activities()
+        self.record_shapes = record_shapes
+        self.with_flops = with_flops
+        self.profile_memory = profile_memory
+        self.with_stack = with_stack
+        self.with_modules = with_modules
+        self.profiler: Optional[prof.profile] = None
+
+    def start(self):
+        self.prepare_trace()
+        self.start_trace()
+
+    def stop(self):
+        self.stop_trace()
+
+    def prepare_trace(self):
+        self.profiler = prof.profile(
+            use_cuda=(ProfilerActivity.CUDA in self.activities),
+            use_cpu=(ProfilerActivity.CPU in self.activities),
+            record_shapes=self.record_shapes,
+            with_flops=self.with_flops,
+            profile_memory=self.profile_memory,
+            with_stack=self.with_stack,
+            with_modules=self.with_modules,
+            use_kineto=True,
+        )
+        self.profiler._prepare_trace()
+
+    def start_trace(self):
+        assert self.profiler is not None
+        self.profiler._start_trace()
+
+        if kineto_available():
+            dist_info = self._get_distributed_info()
+            if dist_info:
+                self.add_metadata_json("distributedInfo", json.dumps(dist_info))
+
+    def stop_trace(self):
+        assert self.profiler is not None
+        self.profiler.__exit__(None, None, None)
+
+    def export_chrome_trace(self, path: str):
+        assert self.profiler
+        if path.endswith('.gz'):
+            fp = tempfile.NamedTemporaryFile('w+t', suffix='.json', delete=False)
+            fp.close()
+            retvalue = self.profiler.export_chrome_trace(fp.name)
+            with open(fp.name) as fin:
+                with gzip.open(path, 'wt') as fout:
+                    fout.writelines(fin)
+            os.remove(fp.name)
+            return retvalue
+        else:
+            return self.profiler.export_chrome_trace(path)
+
+    def export_stacks(self, path: str, metric: str = "self_cpu_time_total"):
+        assert self.profiler
+        return self.profiler.export_stacks(path, metric)
+
+    def key_averages(self, group_by_input_shape: bool = False, group_by_stack_n: int = 0):
+        assert self.profiler
+        return self.profiler.key_averages(group_by_input_shape, group_by_stack_n)
+
+    def events(self):
+        assert self.profiler
+        return self.profiler.function_events
+
+    def add_metadata(self, key: str, value: str):
+        wrapped_value = "\"" + value.replace('"', '\\"') + "\""
+        torch.autograd._add_metadata_json(key, wrapped_value)
+
+    def add_metadata_json(self, key: str, value: str):
+        torch.autograd._add_metadata_json(key, value)
+
+    def _get_distributed_info(self):
+        import torch.distributed as dist
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+
+        return {
+            "backend": dist.get_backend(),
+            "rank": dist.get_rank(),
+            "world_size": dist.get_world_size()
+        }
+
+
+class ProfilerAction(Enum):
+    NONE = 0
+    WARMUP = 1
+    RECORD = 2
+    RECORD_AND_SAVE = 3
+
+
+def schedule(*, wait: int, warmup: int, active: int, repeat: int = 0, skip_first: int = 0) -> Callable:
+    def schedule_fn(step: int) -> ProfilerAction:
+        assert step >= 0
+        if step < skip_first:
+            return ProfilerAction.NONE
+        else:
+            step -= skip_first
+        num_steps = wait + warmup + active
+        if repeat > 0 and step / num_steps >= repeat:
+            return ProfilerAction.NONE
+        mod_step = step % num_steps
+        if mod_step < wait:
+            return ProfilerAction.NONE
+        elif mod_step < wait + warmup:
+            return ProfilerAction.WARMUP
+        else:
+            return ProfilerAction.RECORD if mod_step < num_steps - 1 \
+                else ProfilerAction.RECORD_AND_SAVE
+    assert wait >= 0 and warmup >= 0 and active > 0 and \
+           repeat >= 0 and skip_first >= 0, "Invalid profiler schedule arguments"
+    if warmup == 0:
+        warn("Profiler won't be using warmup, this can skew profiler results")
+    return schedule_fn
+
+
+def _default_schedule_fn(_: int) -> ProfilerAction:
+    return ProfilerAction.RECORD
+
+def tensorboard_trace_handler(dir_name: str, worker_name: Optional[str] = None, use_gzip: bool = False):
+    import os
+    import socket
+    import time
+
+    def handler_fn(prof) -> None:
+        nonlocal worker_name
+        if not os.path.isdir(dir_name):
+            try:
+                os.makedirs(dir_name, exist_ok=True)
+            except Exception:
+                raise RuntimeError("Can't create directory: " + dir_name)
+        if not worker_name:
+            worker_name = "{}_{}".format(socket.gethostname(), str(os.getpid()))
+        file_name = "{}.{}.pt.trace.json".format(worker_name, int(time.time() * 1000))
+        if use_gzip:
+            file_name = file_name + '.gz'
+        prof.export_chrome_trace(os.path.join(dir_name, file_name))
+    return handler_fn
+
+
+class profile(_KinetoProfile):
+    def __init__(
+            self,
+            *,
+            activities: Optional[Iterable[ProfilerActivity]] = None,
+            schedule: Optional[Callable[[int], ProfilerAction]] = None,
+            on_trace_ready: Optional[Callable[..., Any]] = None,
+            record_shapes: bool = False,
+            profile_memory: bool = False,
+            with_stack: bool = False,
+            with_flops: bool = False,
+            with_modules: bool = False,
+            use_cuda: Optional[bool] = None):
+
+        activities_set = set(activities) if activities else supported_activities()
+        if use_cuda is not None:
+            warn("use_cuda is deprecated, use activities argument instead")
+            if use_cuda:
+                activities_set.add(ProfilerActivity.CUDA)
+            elif ProfilerActivity.CUDA in activities_set:
+                activities_set.remove(ProfilerActivity.CUDA)
+        assert len(activities_set) > 0, "No valid profiler activities found"
+
+        super().__init__(
+            activities=activities,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+            with_flops=with_flops,
+            with_modules=with_modules
+        )
+
+        if schedule:
+            self.schedule = schedule
+            self.record_steps = True
+        else:
+            self.schedule = _default_schedule_fn
+            self.record_steps = False
+        self.on_trace_ready = on_trace_ready
+        self.step_num = 0
+        self.current_action = self.schedule(self.step_num)
+        self.step_rec_fn: Optional[prof.record_function] = None
+
+        self.action_map: Dict[Tuple[ProfilerAction, Optional[ProfilerAction]], List[Any]] = {
+            (ProfilerAction.NONE, ProfilerAction.NONE): [],
+            (ProfilerAction.NONE, ProfilerAction.WARMUP): [self.prepare_trace],
+            (ProfilerAction.NONE, ProfilerAction.RECORD): [self.prepare_trace, self.start_trace],
+            (ProfilerAction.NONE, ProfilerAction.RECORD_AND_SAVE): [self.prepare_trace, self.start_trace],
+            (ProfilerAction.WARMUP, ProfilerAction.NONE): [
+                partial(warn, "Incorrect schedule: WARMUP followed by NONE"),
+                self.start_trace,
+                self.stop_trace],
+            (ProfilerAction.WARMUP, ProfilerAction.WARMUP): [],
+            (ProfilerAction.WARMUP, ProfilerAction.RECORD): [self.start_trace],
+            (ProfilerAction.WARMUP, ProfilerAction.RECORD_AND_SAVE): [self.start_trace],
+            (ProfilerAction.RECORD, ProfilerAction.NONE): [
+                partial(warn, "Incorrect schedule: RECORD followed by NONE"),
+                self.stop_trace],
+            (ProfilerAction.RECORD, ProfilerAction.WARMUP): [
+                partial(warn, "Incorrect schedule: RECORD followed by WARMUP"),
+                self.stop_trace],
+            (ProfilerAction.RECORD, ProfilerAction.RECORD): [],
+            (ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE): [],
+            (ProfilerAction.RECORD_AND_SAVE, ProfilerAction.NONE): [self.stop_trace, self._trace_ready],
+            (ProfilerAction.RECORD_AND_SAVE, ProfilerAction.WARMUP): [self.stop_trace, self._trace_ready, self.prepare_trace],
+            (ProfilerAction.RECORD_AND_SAVE, ProfilerAction.RECORD): [
+                self.stop_trace,
+                self._trace_ready,
+                self.prepare_trace,
+                self.start_trace],
+            (ProfilerAction.RECORD_AND_SAVE, ProfilerAction.RECORD_AND_SAVE): [
+                self.stop_trace,
+                self._trace_ready,
+                self.prepare_trace,
+                self.start_trace],
+            (ProfilerAction.WARMUP, None): [self.start_trace, self.stop_trace],
+            (ProfilerAction.RECORD, None): [self.stop_trace, self._trace_ready],
+            (ProfilerAction.RECORD_AND_SAVE, None): [self.stop_trace, self._trace_ready]
+        }
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def start(self):
+        self._transit_action(ProfilerAction.NONE, self.current_action)
+        if self.record_steps:
+            self.step_rec_fn = prof.record_function("ProfilerStep#" + str(self.step_num))
+            self.step_rec_fn.__enter__()
+
+    def stop(self):
+        if self.record_steps and self.step_rec_fn:
+            self.step_rec_fn.__exit__(None, None, None)
+        self._transit_action(self.current_action, None)
+
+    def step(self):
+        if self.record_steps and self.step_rec_fn:
+            self.step_rec_fn.__exit__(None, None, None)
+        prev_action = self.current_action
+        self.step_num += 1
+        self.current_action = self.schedule(self.step_num)
+
+        self._transit_action(prev_action, self.current_action)
+
+        if self.record_steps:
+            self.step_rec_fn = prof.record_function("ProfilerStep#" + str(self.step_num))
+            self.step_rec_fn.__enter__()
+
+    def _trace_ready(self):
+        if self.on_trace_ready:
+            self.on_trace_ready(self)
+
+    def _transit_action(self, prev_action, current_action):
+        action_list = self.action_map.get((prev_action, current_action))
+        if action_list:
+            for action in action_list:
+                action()
