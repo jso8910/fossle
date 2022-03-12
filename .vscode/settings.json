@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.asm": "customasm",
+        "netdata": "c"
+    }
+}

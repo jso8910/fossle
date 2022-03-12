@@ -1,0 +1,385 @@
+DeferredSetupFunction = t.Callable[["BlueprintSetupState"], t.Callable]
+
+
+class BlueprintSetupState:
+
+    def __init__(
+        self,
+        blueprint: "Blueprint",
+        app: "Flask",
+        options: t.Any,
+        first_registration: bool,
+    ) -> None:
+        self.app = app
+
+        self.blueprint = blueprint
+
+        self.options = options
+
+        self.first_registration = first_registration
+
+        subdomain = self.options.get("subdomain")
+        if subdomain is None:
+            subdomain = self.blueprint.subdomain
+
+
+        self.subdomain = subdomain
+
+        url_prefix = self.options.get("url_prefix")
+        if url_prefix is None:
+            url_prefix = self.blueprint.url_prefix
+
+        self.url_prefix = url_prefix
+
+        self.name = self.options.get("name", blueprint.name)
+        self.name_prefix = self.options.get("name_prefix", "")
+
+        self.url_defaults = dict(self.blueprint.url_values_defaults)
+        self.url_defaults.update(self.options.get("url_defaults", ()))
+
+    def add_url_rule(
+        self,
+        rule: str,
+        endpoint: t.Optional[str] = None,
+        view_func: t.Optional[t.Callable] = None,
+        **options: t.Any,
+    ) -> None:
+        if self.url_prefix is not None:
+            if rule:
+                rule = "/".join((self.url_prefix.rstrip("/"), rule.lstrip("/")))
+            else:
+                rule = self.url_prefix
+        options.setdefault("subdomain", self.subdomain)
+        if endpoint is None:
+            endpoint = _endpoint_from_view_func(view_func)
+        defaults = self.url_defaults
+        if "defaults" in options:
+            defaults = dict(defaults, **options.pop("defaults"))
+
+        self.app.add_url_rule(
+            rule,
+            f"{self.name_prefix}.{self.name}.{endpoint}".lstrip("."),
+            view_func,
+            defaults=defaults,
+            **options,
+        )
+
+
+class Blueprint(Scaffold):
+
+    warn_on_modifications = False
+    _got_registered_once = False
+
+    json_encoder = None
+
+    json_decoder = None
+
+    def __init__(
+        self,
+        name: str,
+        import_name: str,
+        static_folder: t.Optional[t.Union[str, os.PathLike]] = None,
+        static_url_path: t.Optional[str] = None,
+        template_folder: t.Optional[str] = None,
+        url_prefix: t.Optional[str] = None,
+        subdomain: t.Optional[str] = None,
+        url_defaults: t.Optional[dict] = None,
+        root_path: t.Optional[str] = None,
+        cli_group: t.Optional[str] = _sentinel,
+    ):
+        super().__init__(
+            import_name=import_name,
+            static_folder=static_folder,
+            static_url_path=static_url_path,
+            template_folder=template_folder,
+            root_path=root_path,
+        )
+
+        if "." in name:
+            raise ValueError("'name' may not contain a dot '.' character.")
+
+        self.name = name
+        self.url_prefix = url_prefix
+        self.subdomain = subdomain
+        self.deferred_functions: t.List[DeferredSetupFunction] = []
+
+        if url_defaults is None:
+            url_defaults = {}
+
+        self.url_values_defaults = url_defaults
+        self.cli_group = cli_group
+        self._blueprints: t.List[t.Tuple["Blueprint", dict]] = []
+
+    def _is_setup_finished(self) -> bool:
+        return self.warn_on_modifications and self._got_registered_once
+
+    def record(self, func: t.Callable) -> None:
+
+        if self._got_registered_once and self.warn_on_modifications:
+            from warnings import warn
+
+            warn(
+                Warning(
+                    "The blueprint was already registered once but is"
+                    " getting modified now. These changes will not show"
+                    " up."
+                )
+            )
+        self.deferred_functions.append(func)
+
+    def record_once(self, func: t.Callable) -> None:
+
+
+        def wrapper(state: BlueprintSetupState) -> None:
+            if state.first_registration:
+                func(state)
+
+        return self.record(update_wrapper(wrapper, func))
+
+    def make_setup_state(
+        self, app: "Flask", options: dict, first_registration: bool = False
+    ) -> BlueprintSetupState:
+
+        return BlueprintSetupState(self, app, options, first_registration)
+
+    def register_blueprint(self, blueprint: "Blueprint", **options: t.Any) -> None:
+
+        if blueprint is self:
+            raise ValueError("Cannot register a blueprint on itself")
+        self._blueprints.append((blueprint, options))
+
+    def register(self, app: "Flask", options: dict) -> None:
+
+        name_prefix = options.get("name_prefix", "")
+        self_name = options.get("name", self.name)
+        name = f"{name_prefix}.{self_name}".lstrip(".")
+
+        if name in app.blueprints:
+            bp_desc = "this" if app.blueprints[name] is self else "a different"
+            existing_at = f" '{name}'" if self_name != name else ""
+
+            raise ValueError(
+                f"The name '{self_name}' is already registered for"
+                f" {bp_desc} blueprint{existing_at}. Use 'name=' to"
+                f" provide a unique name."
+            )
+
+        first_bp_registration = not any(bp is self for bp in app.blueprints.values())
+        first_name_registration = name not in app.blueprints
+
+        app.blueprints[name] = self
+        self._got_registered_once = True
+        state = self.make_setup_state(app, options, first_bp_registration)
+
+        if self.has_static_folder:
+            state.add_url_rule(
+                f"{self.static_url_path}/<path:filename>",
+                view_func=self.send_static_file,
+                endpoint="static",
+            )
+
+        if first_bp_registration or first_name_registration:
+
+            def extend(bp_dict, parent_dict):
+                for key, values in bp_dict.items():
+                    key = name if key is None else f"{name}.{key}"
+                    parent_dict[key].extend(values)
+
+            for key, value in self.error_handler_spec.items():
+                key = name if key is None else f"{name}.{key}"
+                value = defaultdict(
+                    dict,
+                    {
+                        code: {
+                            exc_class: func for exc_class, func in code_values.items()
+                        }
+                        for code, code_values in value.items()
+                    },
+                )
+                app.error_handler_spec[key] = value
+
+            for endpoint, func in self.view_functions.items():
+                app.view_functions[endpoint] = func
+
+            extend(self.before_request_funcs, app.before_request_funcs)
+            extend(self.after_request_funcs, app.after_request_funcs)
+            extend(
+                self.teardown_request_funcs,
+                app.teardown_request_funcs,
+            )
+            extend(self.url_default_functions, app.url_default_functions)
+            extend(self.url_value_preprocessors, app.url_value_preprocessors)
+            extend(self.template_context_processors, app.template_context_processors)
+
+        for deferred in self.deferred_functions:
+            deferred(state)
+
+        cli_resolved_group = options.get("cli_group", self.cli_group)
+
+        if self.cli.commands:
+            if cli_resolved_group is None:
+                app.cli.commands.update(self.cli.commands)
+            elif cli_resolved_group is _sentinel:
+                self.cli.name = name
+                app.cli.add_command(self.cli)
+            else:
+                self.cli.name = cli_resolved_group
+                app.cli.add_command(self.cli)
+
+        for blueprint, bp_options in self._blueprints:
+            bp_options = bp_options.copy()
+            bp_url_prefix = bp_options.get("url_prefix")
+
+            if bp_url_prefix is None:
+                bp_url_prefix = blueprint.url_prefix
+
+            if state.url_prefix is not None and bp_url_prefix is not None:
+                bp_options["url_prefix"] = (
+                    state.url_prefix.rstrip("/") + "/" + bp_url_prefix.lstrip("/")
+                )
+            elif bp_url_prefix is not None:
+                bp_options["url_prefix"] = bp_url_prefix
+            elif state.url_prefix is not None:
+                bp_options["url_prefix"] = state.url_prefix
+
+            bp_options["name_prefix"] = name
+            blueprint.register(app, bp_options)
+
+    def add_url_rule(
+        self,
+        rule: str,
+        endpoint: t.Optional[str] = None,
+        view_func: t.Optional[t.Callable] = None,
+        provide_automatic_options: t.Optional[bool] = None,
+        **options: t.Any,
+    ) -> None:
+
+        if endpoint and "." in endpoint:
+            raise ValueError("'endpoint' may not contain a dot '.' character.")
+
+        if view_func and hasattr(view_func, "__name__") and "." in view_func.__name__:
+            raise ValueError("'view_func' name may not contain a dot '.' character.")
+
+        self.record(
+            lambda s: s.add_url_rule(
+                rule,
+                endpoint,
+                view_func,
+                provide_automatic_options=provide_automatic_options,
+                **options,
+            )
+        )
+
+    def app_template_filter(
+        self, name: t.Optional[str] = None
+    ) -> t.Callable[[TemplateFilterCallable], TemplateFilterCallable]:
+
+
+        def decorator(f: TemplateFilterCallable) -> TemplateFilterCallable:
+            self.add_app_template_filter(f, name=name)
+            return f
+
+        return decorator
+
+    def add_app_template_filter(
+        self, f: TemplateFilterCallable, name: t.Optional[str] = None
+    ) -> None:
+
+
+        def register_template(state: BlueprintSetupState) -> None:
+            state.app.jinja_env.filters[name or f.__name__] = f
+
+        self.record_once(register_template)
+
+    def app_template_test(
+        self, name: t.Optional[str] = None
+    ) -> t.Callable[[TemplateTestCallable], TemplateTestCallable]:
+
+        def decorator(f: TemplateTestCallable) -> TemplateTestCallable:
+            self.add_app_template_test(f, name=name)
+            return f
+
+        return decorator
+
+    def add_app_template_test(
+        self, f: TemplateTestCallable, name: t.Optional[str] = None
+    ) -> None:
+        def register_template(state: BlueprintSetupState) -> None:
+            state.app.jinja_env.tests[name or f.__name__] = f
+
+        self.record_once(register_template)
+
+    def app_template_global(
+        self, name: t.Optional[str] = None
+    ) -> t.Callable[[TemplateGlobalCallable], TemplateGlobalCallable]:
+
+        def decorator(f: TemplateGlobalCallable) -> TemplateGlobalCallable:
+            self.add_app_template_global(f, name=name)
+            return f
+
+        return decorator
+
+    def add_app_template_global(
+        self, f: TemplateGlobalCallable, name: t.Optional[str] = None
+    ) -> None:
+
+        def register_template(state: BlueprintSetupState) -> None:
+            state.app.jinja_env.globals[name or f.__name__] = f
+
+        self.record_once(register_template)
+
+    def before_app_request(self, f: BeforeRequestCallable) -> BeforeRequestCallable:
+        self.record_once(
+            lambda s: s.app.before_request_funcs.setdefault(None, []).append(f)
+        )
+        return f
+
+    def before_app_first_request(
+        self, f: BeforeFirstRequestCallable
+    ) -> BeforeFirstRequestCallable:
+        self.record_once(lambda s: s.app.before_first_request_funcs.append(f))
+        return f
+
+    def after_app_request(self, f: AfterRequestCallable) -> AfterRequestCallable:
+        self.record_once(
+            lambda s: s.app.after_request_funcs.setdefault(None, []).append(f)
+        )
+        return f
+
+    def teardown_app_request(self, f: TeardownCallable) -> TeardownCallable:
+        self.record_once(
+            lambda s: s.app.teardown_request_funcs.setdefault(None, []).append(f)
+        )
+        return f
+
+    def app_context_processor(
+        self, f: TemplateContextProcessorCallable
+    ) -> TemplateContextProcessorCallable:
+        self.record_once(
+            lambda s: s.app.template_context_processors.setdefault(None, []).append(f)
+        )
+        return f
+
+    def app_errorhandler(self, code: t.Union[t.Type[Exception], int]) -> t.Callable:
+
+        def decorator(
+            f: "ErrorHandlerCallable[Exception]",
+        ) -> "ErrorHandlerCallable[Exception]":
+            self.record_once(lambda s: s.app.errorhandler(code)(f))
+            return f
+
+        return decorator
+
+    def app_url_value_preprocessor(
+        self, f: URLValuePreprocessorCallable
+    ) -> URLValuePreprocessorCallable:
+        self.record_once(
+            lambda s: s.app.url_value_preprocessors.setdefault(None, []).append(f)
+        )
+        return f
+
+    def app_url_defaults(self, f: URLDefaultCallable) -> URLDefaultCallable:
+        self.record_once(
+            lambda s: s.app.url_default_functions.setdefault(None, []).append(f)
+        )
+        return f
