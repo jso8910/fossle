@@ -2,8 +2,8 @@ import type { NextPage } from 'next'
 import styles from '../styles/Home.module.css'
 import Select, { SingleValue } from 'react-select'
 import React, { useEffect, useState } from 'react'
-import Prism from 'prismjs'
-import 'prismjs/themes/prism-okaidia.min.css'
+import hljs from 'highlight.js'
+import 'highlight.js/styles/a11y-dark.css';
 import ReactCardFlip from 'react-card-flip';
 import { FaCog, FaQuestionCircle, FaChartBar } from 'react-icons/fa'
 import { VscChromeClose } from 'react-icons/vsc'
@@ -70,7 +70,6 @@ const isInfo = (o: any) : o is Info => {
 }
 
 const Home: NextPage = () => {
-  require('prismjs/components/prism-typescript.min.js');
   const TelemetryDeck = typeof window !== 'undefined' ? require('@telemetrydeck/sdk') : undefined
   const td = typeof window !== 'undefined' ? new TelemetryDeck.TelemetryDeck({ app: '68F10CF1-EBCB-4149-8573-FB46F8C1187B', user: 'anonymous' }) : undefined;
   // td && td.signal({
@@ -106,44 +105,43 @@ const Home: NextPage = () => {
     'django/django': 'django',
     'moby/moby': 'moby',
     'bitcoin/bitcoin': 'bitcoin',
-    'Genymobile/scrcpy': 'scrcpy',
+    'genymobile/scrcpy': 'scrcpy',
     'webpack/webpack': 'webpack',
     'opencv/opencv': 'opencv',
     'apple/swift': 'swift',
     'elastic/elasticsearch': 'elasticsearch',
-    // 'hakimel/reveal.js': 'revealjs',
-    // 'netdata/netdata': 'netdata',
-    // 'pallets/flask': 'flask',
-    // 'reduxjs/redux': 'redux',
-    // 'gohugoio/hugo': 'hugo',
-    // 'atom/atom': 'atom',
-    // 'chartjs/Chart.js': 'chartjs',
-    // 'expressjs/express': 'expressjs',
-    // 'gin-gonic/gin': 'gin',
-    // 'jquery/jquery': 'jquery',
-    // 'socketio/socket.io': 'socketio',
-    // 'adam-p/markdown-here': 'markdown-here',
-    // 'keras-team/keras': 'keras',
-    // 'pytorch/pytorch': 'pytorch',
-    // 'shadowsocks/shadowsocks-windows': 'shadowsocks-windows',
-    // 'fatedier/frp': 'frp',
-    // 'redis/redis': 'redis',
-    // 'gatsbyjs/gatsby': 'gatsbyjs',
-    // 'ansible/ansible': 'ansible',
-    // 'lodash/lodash': 'lodash',
-    // 'ElemeFE/element': 'ElemeFE',
-    // 'neovim/neovim': 'neovim',
-    // 'rails/rails': 'rails',
+    'hakimel/reveal.js': 'revealjs',
+    'netdata/netdata': 'netdata',
+    'pallets/flask': 'flask',
+    'reduxjs/redux': 'redux',
+    'gohugoio/hugo': 'hugo',
+    'atom/atom': 'atom',
+    'chartjs/Chart.js': 'chartjs',
+    'expressjs/express': 'expressjs',
+    'gin-gonic/gin': 'gin',
+    'jquery/jquery': 'jquery',
+    'socketio/socket.io': 'socketio',
+    'adam-p/markdown-here': 'markdown-here',
+    'keras-team/keras': 'keras',
+    'pytorch/pytorch': 'pytorch',
+    'shadowsocks/shadowsocks-windows': 'shadowsocks-windows',
+    'fatedier/frp': 'frp',
+    'redis/redis': 'redis',
+    'gatsbyjs/gatsby': 'gatsbyjs',
+    'ansible/ansible': 'ansible',
+    'elemeFE/element': 'ElemeFE',
+    'neovim/neovim': 'neovim',
+    'rails/rails': 'rails',
     // 'home-assistant/core': 'home-assistant',
     // 'apache/echarts': 'apache-echarts',
-    // 'Semantic-Org/Semantic-UI': 'semantic-ui',
+    // 'semantic-Org/Semantic-UI': 'semantic-ui',
     // 'scikit-learn/scikit-learn': 'scikit-learn',
     // 'grafana/grafana': 'grafana',
     // 'ionic-team/ionic-framework': 'ionic-framework',
     // 'spring-projects/spring-framework': 'spring-framework',
     // 'moment/moment': 'moment',
     // 'godotengine/godot': 'godot',
-    // 'ReactiveX/RxJava': 'RxJava',
+    // 'reactiveX/RxJava': 'RxJava',
     // 'apache/superset': 'apache-superset',
     // 'nestjs/nest': 'nestjs',
     // 'jekyll/jekyll': 'jekyll',
@@ -171,7 +169,7 @@ const Home: NextPage = () => {
     // 'nwjs/nw.js': 'nwjs',
     // 'localstack/localstack': 'localstack',
     // 'gogs/gogs': 'gogs',
-    // 'JuliaLang/julia': 'julia',
+    // 'juliaLang/julia': 'julia',
     // 'facebook/jest': 'jest',
     // 'vercel/hyper': 'hyper',
     // 'iamkun/dayjs': 'dayjs',
@@ -379,7 +377,6 @@ const Home: NextPage = () => {
       })
       .catch(error => console.error(error))
   }, [currentProject, failed]);
-  useEffect(() => {Prism.highlightAll()}, [data])
   const onSubmit = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const target = event.target as typeof event.target & {
@@ -661,13 +658,12 @@ const Home: NextPage = () => {
       
       <div style={{overflowY: "scroll", height:"70vh", borderRadius: "10px", margin:"0px", padding:"0px"}}>
         <pre style={{margin:"0px"}}>
-          <code style={{margin:"0px", padding:"0px", height:"100%"}} className="language-typescript">
-            {data}
+          <code style={{margin:"0px", padding:"5px", height:"100%", fontSize: "12pt"}} dangerouslySetInnerHTML={{__html: hljs.highlightAuto(data).value}} className="hljs">
           </code>
         </pre>
       </div>
       
-      <p>Note: Sometime I will remove imports to make it less obvious what project something is in. This code will not compile.</p>
+      <p>Note: Sometime I will remove imports or rename variables to make it less obvious what project something is in. This code will not compile.</p>
       <div id="overlay-help" onClick={() => overlayClose("help", undefined)} style={{display: 'none'}}>
         <div style={{position: "fixed", top: "0", bottom: "0", left: "0", right: "0", display: 'flex', background: 'rgb(0,0,0,0.5)', textAlign: 'center', height: "100%", width: "100%", alignItems: "center", justifyContent: "center"}}>
           <div style={{
@@ -702,7 +698,7 @@ const Home: NextPage = () => {
             <h3 style={{margin: '0px'}}><VscChromeClose style={{cursor: "pointer"}} /></h3>
             <div style={{display: 'inline-block', margin: "0px 10px"}}>
               <div style={{textAlign: 'center'}}>
-                <h1 style={{width: "5ch", margin: '0'}}>{Object.values(stats.stats).reduce((old, b) => old + b)}</h1>
+                <h1 style={{width: "5ch", margin: '0'}}>{Object.values(stats.stats).reduce((old, b) => old + b).toString()}</h1>
               </div>
               <div style={{display: 'flex', justifyContent: 'center'}}>
                 <h4 style={{margin: '0'}}><h1 style={{width: '5ch', margin: "0"}}/>Games played</h4>
@@ -710,7 +706,7 @@ const Home: NextPage = () => {
             </div>
             <div style={{display: 'inline-block', margin: "0px 10px"}}>
               <div style={{textAlign: 'center'}}>
-                <h1 style={{width: "3ch", margin: '0'}}>{Math.round((Object.values(stats.stats).reduce((old, b) => old + b) - stats.stats.lost)/(Object.values(stats.stats).reduce((old, b) => old + b)) * 100)}</h1>
+                <h1 style={{width: "3ch", margin: '0'}}>{Math.round((Object.values(stats.stats).reduce((old, b) => old + b) - stats.stats.lost)/(Object.values(stats.stats).reduce((old, b) => old + b)) * 100).toString()}</h1>
               </div>
               <div style={{display: 'flex', justifyContent: 'center'}}>
                 <h4 style={{margin: '0'}}>Win %</h4>
